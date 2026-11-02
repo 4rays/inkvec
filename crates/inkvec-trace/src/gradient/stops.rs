@@ -95,7 +95,15 @@ type Rhs = [[f64; 3]; MAX_NODES];
 /// of times per image, and the heap `Vec<Vec<f64>>` it used to take cost an allocation
 /// per row. The elimination is the same one, operation for operation, so the solution is
 /// the same bits. Not from the literature: an allocation removed.
-fn solve_small(mut a: Mat, mut b: Rhs, n: usize) -> Option<Vec<[f64; 3]>> {
+fn solve_small(a: Mat, b: Rhs, n: usize) -> Option<Vec<[f64; 3]>> {
+    solve_small_stack(a, b, n).map(|x| x[..n].to_vec())
+}
+
+// vectini: the same elimination with the solution on the stack, for the knot scan,
+// which calls it up to a thousand times per round. Operation for operation the
+// upstream `solve_small`, so the bits are the same.
+/// [`solve_small`] without the allocation: the solution's first `n` rows are set.
+fn solve_small_stack(mut a: Mat, mut b: Rhs, n: usize) -> Option<[[f64; 3]; MAX_NODES]> {
     for i in 0..n {
         let piv = (i..n).max_by(|&p, &q| a[p][i].abs().total_cmp(&a[q][i].abs()))?;
         if a[piv][i].abs() < 1e-12 {
@@ -117,7 +125,7 @@ fn solve_small(mut a: Mat, mut b: Rhs, n: usize) -> Option<Vec<[f64; 3]>> {
             }
         }
     }
-    let mut x = vec![[0.0; 3]; n];
+    let mut x = [[0.0; 3]; MAX_NODES];
     for i in (0..n).rev() {
         for k in 0..3 {
             let mut s = b[i][k];

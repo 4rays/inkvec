@@ -813,6 +813,12 @@ fn ramp_candidates(s: &Samples, w: usize) -> Vec<(Interp, Vec<[f64; 3]>, Vec<Fil
 /// `w` is the image width, needed to find a sample's 4-neighbours by pixel index. The
 /// work is parallel (rayon) but the output order is the serial one, so ties are broken
 /// the same way on any number of threads.
+/// vectini: see the note inside `fit_samples`. `VECTINI_STOPS_ALL=1` restores the
+/// upstream policy (stops for every admissible candidate) for A/B runs.
+fn stops_only_best_per_space() -> bool {
+    !inkvec_core::env::flag("VECTINI_STOPS_ALL")
+}
+
 fn fit_samples(s: &Samples, w: usize, strict: bool, sigma: f64, lambda: f64) -> Vec<FillFit> {
     let sigma = if sigma > 0.0 { sigma } else { 0.5 / 255.0 };
     // A candidate and its predictions at the scored samples, scored.
@@ -873,11 +879,17 @@ fn fit_samples(s: &Samples, w: usize, strict: bool, sigma: f64, lambda: f64) -> 
         .iter()
         .flat_map(|(space, cols, cands)| cands.iter().map(move |c| (*space, &cols[..], c)))
         .collect();
-    let fitted: Vec<Vec<FillFit>> = jobs
+    // vectini: the interior-stop search is the costliest part of a union fit (a
+    // thousand-offset exact scan per reweighting round, per knot, per candidate), and
+    // every candidate that passes the gates used to get one. With
+    // `STOPS_ONLY_BEST_PER_SPACE` the search runs only for the cheapest two-stop
+    // candidate of each interpolation space; the other candidates keep their two-stop
+    // fit. Measured on the engine benchmark (see vector-core/bench); off reproduces
+    // upstream bit for bit.
+    let gated: Vec<Option<FillFit>> = jobs
         .par_iter()
-        .map(|&(space, cols, cand)| {
+        .map(|&(_space, _cols, cand)| {
             let cand = cand.clone();
-            let mut out = Vec::new();
             // One evaluation of the candidate per scored sample, read by all three
             // scores (see `score`).
             let preds = Predictions::new(&cand, s);
@@ -908,10 +920,39 @@ fn fit_samples(s: &Samples, w: usize, strict: bool, sigma: f64, lambda: f64) -> 
                         cand.kind(), s.len(), contrast, min_contrast, support, MIN_RAMP_SUPPORT, data_range
                     );
                 }
-                return out;
+                return None;
             }
-            let multi = fit_mid_stops(&cand, s, cols, space);
-            out.push(scored(cand, &preds));
+            Some(scored(cand, &preds))
+        })
+        .collect();
+    // Which candidates get their interior stops searched.
+    let wants_stops: Vec<bool> = if stops_only_best_per_space() {
+        let mut best: std::collections::BTreeMap<u8, (f64, usize)> = Default::default();
+        for (i, (g, &(space, _, _))) in gated.iter().zip(&jobs).enumerate() {
+            let Some(fit) = g else { continue };
+            let key = space as u8;
+            let better = best.get(&key).is_none_or(|&(c, _)| fit.cost < c);
+            if better {
+                best.insert(key, (fit.cost, i));
+            }
+        }
+        let chosen: std::collections::BTreeSet<usize> = best.values().map(|&(_, i)| i).collect();
+        (0..jobs.len()).map(|i| chosen.contains(&i)).collect()
+    } else {
+        gated.iter().map(|g| g.is_some()).collect()
+    };
+    let fitted: Vec<Vec<FillFit>> = jobs
+        .par_iter()
+        .zip(&gated)
+        .zip(&wants_stops)
+        .map(|((&(space, cols, _), g), &stops)| {
+            let mut out = Vec::new();
+            let Some(fit) = g else {
+                return out;
+            };
+            let cand = fit.model.clone();
+            let multi = if stops { fit_mid_stops(&cand, s, cols, space) } else { Vec::new() };
+            out.push(fit.clone());
             for m in multi {
                 let pm = Predictions::new(&m, s);
                 let c = pm.contrast();

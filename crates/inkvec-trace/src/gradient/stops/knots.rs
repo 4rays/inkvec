@@ -55,7 +55,7 @@
 //! * D. R. Hunter, K. Lange (2004), A tutorial on MM algorithms, The American Statistician
 //!   58(1). doi:10.1198/0003130042836
 
-use super::{solve_small, Mat, Rhs, MAX_NODES};
+use super::{solve_small_stack, Mat, Rhs, MAX_NODES};
 use std::borrow::Cow;
 
 /// Stop offsets are written with three decimals, so a knot is a multiple of
@@ -69,6 +69,16 @@ pub(super) const OFFSET_STEPS: usize = 1000;
 /// than the old search's in 98.3 % (one stop) and 94.8 % (two stops) of them; two rounds
 /// in 98.2 % and 94.4 %.
 const MM_ROUNDS: usize = 3;
+
+// vectini: `VECTINI_MM_ROUNDS=n` overrides the round count for A/B runs (upstream
+// measured two rounds within a fraction of a percent of three on 600 searches).
+fn mm_rounds() -> usize {
+    std::env::var("VECTINI_MM_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= 1)
+        .unwrap_or(MM_ROUNDS)
+}
 
 /// One bin's weighted moments: `Σw, Σwt, Σwt²`, `Σw·y` and `Σw·t·y` per channel, and
 /// `Σw·|y|²`, with the colour `y` centred on its weighted mean.
@@ -138,6 +148,30 @@ impl BinnedProfile {
     /// residual is `Σw|y|² − Σ x·b`. `None` when the solve is singular.
     fn solve(&self, nodes: &[usize]) -> Option<(f64, Vec<[f64; 3]>)> {
         let m = nodes.len();
+        let (sse, x) = self.solve_stack(nodes)?;
+        let colours = x[..m]
+            .iter()
+            .map(|v| {
+                [
+                    v[0] + self.mean[0],
+                    v[1] + self.mean[1],
+                    v[2] + self.mean[2],
+                ]
+            })
+            .collect();
+        Some((sse, colours))
+    }
+
+    // vectini: the scan prices up to a thousand knot positions per round, and each
+    // price used to allocate twice (the node list and the solution). The assembly and
+    // the elimination below are the upstream ones operation for operation, on stack
+    // arrays, and the centred solution is returned as it is; `solve` adds the mean
+    // back for the one caller that keeps the colours. Same bits, no allocation.
+    /// The weighted sum of squared residuals of the profile with nodes `nodes` and its
+    /// centred node colours (the first `nodes.len()` entries), or `None` when the solve
+    /// is singular or the residual is not finite.
+    fn solve_stack(&self, nodes: &[usize]) -> Option<(f64, [[f64; 3]; MAX_NODES])> {
+        let m = nodes.len();
         let mut a: Mat = [[0.0; MAX_NODES]; MAX_NODES];
         let mut b: Rhs = [[0.0; 3]; MAX_NODES];
         for i in 0..m - 1 {
@@ -159,47 +193,72 @@ impl BinnedProfile {
         for (i, row) in a.iter_mut().enumerate().take(m) {
             row[i] += 1e-9;
         }
-        let x = solve_small(a, b, m)?;
+        let x = solve_small_stack(a, b, m)?;
         let explained: f64 = (0..m)
             .map(|i| (0..3).map(|k| x[i][k] * b[i][k]).sum::<f64>())
             .sum();
         let sse = self.prefix[OFFSET_STEPS + 1][9] - explained;
-        let colours = x
-            .iter()
-            .map(|v| {
-                [
-                    v[0] + self.mean[0],
-                    v[1] + self.mean[1],
-                    v[2] + self.mean[2],
-                ]
-            })
-            .collect();
-        sse.is_finite().then_some((sse, colours))
+        sse.is_finite().then_some((sse, x))
     }
 
     /// The grid position in `lo ..= hi`, not already in `fixed`, whose knot added to `fixed`
     /// leaves the least weighted sum of squares, with that fit; the lowest position on a
     /// tie. `None` when every candidate is singular or none remains.
     fn scan(&self, fixed: &[usize], lo: usize, hi: usize) -> Option<KnotFit> {
-        let mut best: Option<(f64, KnotFit)> = None;
+        // vectini: the node list is built once per candidate on the stack (the knot is
+        // inserted in order rather than sorted), and only the winning position's
+        // colours are materialised. The comparison order and tie rule are unchanged.
+        let mut best: Option<(f64, usize)> = None;
+        let mut nodes = [0usize; MAX_NODES];
+        let m = fixed.len() + 3;
+        debug_assert!(m <= MAX_NODES);
+        // The callers keep their knots ascending; sort a copy regardless, since the
+        // in-order insertion below relies on it.
+        let mut sorted_fixed = [0usize; MAX_NODES];
+        sorted_fixed[..fixed.len()].copy_from_slice(fixed);
+        sorted_fixed[..fixed.len()].sort_unstable();
+        let fixed = &sorted_fixed[..fixed.len()];
         for j in lo..=hi {
             if fixed.contains(&j) {
                 continue;
             }
-            let mut nodes = Vec::with_capacity(fixed.len() + 3);
-            nodes.push(0);
-            nodes.extend_from_slice(fixed);
-            nodes.push(j);
-            nodes.push(OFFSET_STEPS + 1);
-            nodes.sort_unstable();
-            let Some((sse, x)) = self.solve(&nodes) else {
+            // `fixed` is ascending (grid positions of knots kept sorted by the caller);
+            // place `j` among them.
+            let mut n = 1;
+            nodes[0] = 0;
+            let mut placed = false;
+            for &f in fixed {
+                if !placed && j < f {
+                    nodes[n] = j;
+                    n += 1;
+                    placed = true;
+                }
+                nodes[n] = f;
+                n += 1;
+            }
+            if !placed {
+                nodes[n] = j;
+                n += 1;
+            }
+            nodes[n] = OFFSET_STEPS + 1;
+            n += 1;
+            debug_assert_eq!(n, m);
+            let Some((sse, _)) = self.solve_stack(&nodes[..n]) else {
                 continue;
             };
-            if best.as_ref().is_none_or(|b| sse < b.0) {
-                best = Some((sse, KnotFit { j, nodes, x }));
+            if best.is_none_or(|b| sse < b.0) {
+                best = Some((sse, j));
             }
         }
-        best.map(|(_, fit)| fit)
+        let (_, j) = best?;
+        let mut nodes = Vec::with_capacity(fixed.len() + 3);
+        nodes.push(0);
+        nodes.extend_from_slice(fixed);
+        nodes.push(j);
+        nodes.push(OFFSET_STEPS + 1);
+        nodes.sort_unstable();
+        let (_, x) = self.solve(&nodes)?;
+        Some(KnotFit { j, nodes, x })
     }
 }
 
@@ -278,12 +337,13 @@ pub(super) fn best_knot(
 ) -> Option<usize> {
     let mut w = Cow::Borrowed(w0);
     let mut best = None;
-    for round in 0..MM_ROUNDS {
+    let rounds = mm_rounds();
+    for round in 0..rounds {
         let Some(fit) = BinnedProfile::new(t, c, &w).scan(fixed, lo, hi) else {
             break;
         };
         best = Some(fit.j);
-        if round + 1 < MM_ROUNDS {
+        if round + 1 < rounds {
             w = Cow::Owned(huber_weights(t, c, &fit.nodes, &fit.x, delta));
         }
     }

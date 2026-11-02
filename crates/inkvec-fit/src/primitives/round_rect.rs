@@ -44,6 +44,41 @@ pub fn round_rect_distance(p: Point, cx: f64, cy: f64, hw: f64, hh: f64, rx: f64
     outside + inside - rx
 }
 
+// vectini: the closed-form gradient of `round_rect_distance`.
+/// The signed distance of `p` to the rounded rectangle `[cx, cy, hw, hh, rx]` and its
+/// gradient with respect to those five parameters, in that order.
+///
+/// With `qx = |px − cx| − (hw − rx)` and `qy = |py − cy| − (hh − rx)`: outside the
+/// inner rectangle the distance is `hypot(max(qx, 0), max(qy, 0)) − rx`, whose gradient
+/// in `(qx, qy)` is the unit vector towards the point; inside it is `max(qx, qy) − rx`,
+/// whose gradient picks the nearer side. The chain rule then gives
+/// `∂qx/∂cx = −sign(px − cx)`, `∂qx/∂hw = −1`, `∂qx/∂rx = 1` (and the same in y), and
+/// `∂d/∂rx = ∂d/∂qx + ∂d/∂qy − 1`. At the field's kinks (a corner diagonal, a point on
+/// the centre lines) one side's derivative is taken, as a finite difference would.
+pub(crate) fn round_rect_gradient(p: Point, cx: f64, cy: f64, hw: f64, hh: f64, rx: f64) -> (f64, [f64; 5]) {
+    let dx = p.x - cx;
+    let dy = p.y - cy;
+    let sx = if dx >= 0.0 { 1.0 } else { -1.0 };
+    let sy = if dy >= 0.0 { 1.0 } else { -1.0 };
+    let qx = dx.abs() - (hw - rx);
+    let qy = dy.abs() - (hh - rx);
+    let mx = qx.max(0.0);
+    let my = qy.max(0.0);
+    let outside = mx.hypot(my);
+    let inside = qx.max(qy).min(0.0);
+    let d = outside + inside - rx;
+    // ∂d/∂qx, ∂d/∂qy.
+    let (gx, gy) = if outside > 0.0 {
+        (mx / outside, my / outside)
+    } else if qx >= qy {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let j = [-sx * gx, -sy * gy, -gx, -gy, gx + gy - 1.0];
+    (d, j)
+}
+
 /// `Σ w_k·d_k²` for the rounded rectangle `p = [cx, cy, hw, hh, rx]` (centre, half-width,
 /// half-height, corner radius; px), with `w` the per-point weights `1/σ²`.
 pub(crate) fn round_rect_chi2(pts: &[Point], w: &[f64], p: &[f64]) -> f64 {
@@ -137,6 +172,12 @@ pub fn fit_round_rect(pts: &[Point], sigma: &[f64], fixed_rx: Option<f64>) -> Op
 
     let k = if fixed_rx.is_some() { 4 } else { 5 };
     let scale = rmax.max(1.0);
+    // vectini: the Jacobian used to come from central finite differences, eleven
+    // distance evaluations per point per iteration. The distance field is a closed
+    // form (the inner rectangle's signed distance minus the radius), so its gradient
+    // is too; `round_rect_gradient` gives it in one evaluation per point. Set
+    // `VECTINI_RR_FD=1` to run the finite-difference Jacobian instead (A/B).
+    let finite_differences = std::env::var_os("VECTINI_RR_FD").is_some();
     let eval = |p: &[f64]| -> Option<(f64, Vec<Vec<f64>>, Vec<f64>)> {
         let full = |q: &[f64]| -> Vec<f64> {
             let mut v = q.to_vec();
@@ -152,23 +193,30 @@ pub fn fit_round_rect(pts: &[Point], sigma: &[f64], fixed_rx: Option<f64>) -> Op
         let h = 1e-6 * scale;
         let mut plus = Vec::with_capacity(k);
         let mut minus = Vec::with_capacity(k);
-        for a in 0..k {
-            let mut pp = base.clone();
-            pp[a] += h;
-            let mut pm = base.clone();
-            pm[a] -= h;
-            plus.push(pp);
-            minus.push(pm);
+        if finite_differences {
+            for a in 0..k {
+                let mut pp = base.clone();
+                pp[a] += h;
+                let mut pm = base.clone();
+                pm[a] -= h;
+                plus.push(pp);
+                minus.push(pm);
+            }
         }
         for (pt, wk) in pts.iter().zip(&w) {
-            let d = round_rect_distance(*pt, base[0], base[1], base[2], base[3], base[4]);
-            let mut j = [0.0; 5];
-            for a in 0..k {
-                let (pp, pm) = (&plus[a], &minus[a]);
-                let dp = round_rect_distance(*pt, pp[0], pp[1], pp[2], pp[3], pp[4]);
-                let dm = round_rect_distance(*pt, pm[0], pm[1], pm[2], pm[3], pm[4]);
-                j[a] = (dp - dm) / (2.0 * h);
-            }
+            let (d, j) = if finite_differences {
+                let d = round_rect_distance(*pt, base[0], base[1], base[2], base[3], base[4]);
+                let mut j = [0.0; 5];
+                for a in 0..k {
+                    let (pp, pm) = (&plus[a], &minus[a]);
+                    let dp = round_rect_distance(*pt, pp[0], pp[1], pp[2], pp[3], pp[4]);
+                    let dm = round_rect_distance(*pt, pm[0], pm[1], pm[2], pm[3], pm[4]);
+                    j[a] = (dp - dm) / (2.0 * h);
+                }
+                (d, j)
+            } else {
+                round_rect_gradient(*pt, base[0], base[1], base[2], base[3], base[4])
+            };
             chi2 += wk * d * d;
             for a in 0..k {
                 jtr[a] += wk * j[a] * d;

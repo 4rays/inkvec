@@ -111,6 +111,13 @@ pub struct Options {
     /// Detect the faces of the colour trace that were drawn as strokes -- a centreline and one width, with round or butt caps and round or miter joins -- and write each as a stroked path (fill none, one stroke-width) where that describes the face's measured boundary in fewer numbers than its filled outline, at a fit as good within the measurement noise. Line icons come back at about the artist's own parameter count, and a ring on a plain page as one stroke over the page rather than two discs. Quality mode only; on by default.
     pub detect_strokes: bool,
 
+    // vectini: exposes the command line's `--lambda-scale`, so a product-level
+    // "idealization" control can move the price of every parameter rather than only
+    // the coordinate resolution behind `precision`.
+    /// Multiply the description-length cost of every parameter. Above 1.0 buys a plainer, cheaper description (fewer segments, more primitives); below 1.0 a more detailed one. 1.0 is the engine's own objective.
+    #[schemars(extend("exclusiveMinimum" = 0))]
+    pub lambda_scale: f64,
+
     /// Colour groups: fills to draw as one, so the shapes between them join rather than being recoloured. Empty (the default) changes nothing. Groups are separated by ';' and members by ','; a member is a colour '#rrggbb' as it appears in a trace of the same image, or a gradient written as its stop colours joined by '>'. An optional '=' says what the group becomes: '=#rrggbb' a flat colour, '=@n' its n-th member (1-based; a gradient there is refitted over the whole group); without it, the member covering the most of the image. Example: '#c0392b,#e74c3c;#f00>#00f,#0a0=@1'. A group costs one extra trace.
     pub merge_colors: String,
 }
@@ -139,6 +146,7 @@ impl Default for Options {
             harmonize_threshold: a.harmonize_threshold,
             hypotheses: a.hypotheses,
             detect_strokes: a.detect_strokes,
+            lambda_scale: a.lambda_scale,
             // The command line has no groups by default; a spec that parses to none.
             merge_colors: String::new(),
             mode: a.mode.name().to_string(),
@@ -232,6 +240,7 @@ impl Options {
             harmonize_threshold,
             hypotheses,
             detect_strokes,
+            lambda_scale,
             ref merge_colors,
             ref mode,
         } = *self;
@@ -256,6 +265,7 @@ impl Options {
             harmonize_threshold,
             hypotheses,
             detect_strokes,
+            lambda_scale,
             // Validated before any trace against the schema's `enum`.
             mode: mode.parse().unwrap_or_default(),
             // A library never writes to the terminal.
