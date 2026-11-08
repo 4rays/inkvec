@@ -66,7 +66,7 @@ pub struct Options {
     /// Inputs larger than this on their longer side, in pixels, are traced at this size and the SVG is written at the original size. Trace time grows with the pixel count. 0 means no cap.
     pub max_dim: u32,
 
-    /// Advisory wall-clock budget, in seconds; 0 means none. Gradient-band merging stops at 60% of it and the boundary solve gets 25%; the output is still a correct trace, with more fills or a less polished outline. A nonzero budget makes the output depend on machine speed and load, so it is no longer reproducible.
+    /// Advisory wall-clock budget, in seconds; 0 means none. Gradient-band merging stops at 60% of it, the boundary solve gets 25%, and the ring-crossing repair half of it from when that pass starts; the output is still a correct trace, with more fills, a less polished outline, or rings left crossing. A nonzero budget makes the output depend on machine speed and load, so it is no longer reproducible.
     #[schemars(range(min = 0))]
     pub time_budget: f64,
 

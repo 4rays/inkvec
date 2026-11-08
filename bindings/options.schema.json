@@ -41,7 +41,7 @@
       "default": 2048
     },
     "time_budget": {
-      "description": "Advisory wall-clock budget, in seconds; 0 means none. Gradient-band merging stops at 60% of it and the boundary solve gets 25%; the output is still a correct trace, with more fills or a less polished outline. A nonzero budget makes the output depend on machine speed and load, so it is no longer reproducible.",
+      "description": "Advisory wall-clock budget, in seconds; 0 means none. Gradient-band merging stops at 60% of it, the boundary solve gets 25%, and the ring-crossing repair half of it from when that pass starts; the output is still a correct trace, with more fills, a less polished outline, or rings left crossing. A nonzero budget makes the output depend on machine speed and load, so it is no longer reproducible.",
       "type": "number",
       "format": "double",
       "minimum": 0,

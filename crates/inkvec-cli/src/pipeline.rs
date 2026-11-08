@@ -893,16 +893,23 @@ fn repair_fits(
     // can lower every incident one-dimensional residual and still make a neighbouring
     // face's raster coverage worse.
     let cfg_repair = scaled(cfg, args.lambda_scale);
+    // vectini: the ring repair gets half of `--time-budget`, counted from when it starts
+    // (the merge's 60% and the solve's 25% are counted from the start of the trace, and
+    // this pass runs after both). See `repair_ring_crossings` for what stopping ships.
+    let deadline = (args.time_budget > 0.0).then(|| {
+        inkvec_core::clock::Instant::now()
+            + std::time::Duration::from_secs_f64(args.time_budget * 0.5)
+    });
     let mut repaired = if args.no_repair || fast {
         0
     } else {
-        repair_ring_crossings(order, &mut fits.fitted, &fits.polys, &cfg_repair)
+        repair_ring_crossings(order, &mut fits.fitted, &fits.polys, &cfg_repair, deadline)
     };
     if let Some((mut baseline, baseline_prims)) = fits.structural_baseline.take() {
         let baseline_repaired = if args.no_repair {
             0
         } else {
-            repair_ring_crossings(order, &mut baseline, &fits.polys, &cfg_repair)
+            repair_ring_crossings(order, &mut baseline, &fits.polys, &cfg_repair, deadline)
         };
         if !structural_trial_improves(
             &fits.polys,

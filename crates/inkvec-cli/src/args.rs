@@ -92,7 +92,8 @@ pub struct Args {
     /// Inputs larger than this on their longer side are traced at this size and the
     /// SVG is written at the original size, in pixels. 0 means no cap.
     pub max_dim: usize,
-    /// Advisory wall-clock budget, in seconds. 0 means no budget.
+    /// Advisory wall-clock budget, in seconds. 0 means no budget. vectini: the ring
+    /// repair reads it too (half, from when that pass starts).
     pub time_budget: f64,
     /// Exit with status 2 on input that has nothing to trace (a single flat
     /// colour), instead of writing the flat SVG and printing a warning.
@@ -388,9 +389,11 @@ OPTIONS:
                             typical logo under a few seconds. 0 means no cap
                                                                    [default: 2048]
         --time-budget <s>   Advisory wall-clock budget. Gradient-band merging stops at
-                            60% of it, checked between fits, and Quality's boundary
-                            solve gets 25%; the output is still a correct trace, with more
-                            fills or a less polished outline. The palette and the
+                            60% of it, checked between fits, Quality's boundary
+                            solve gets 25%, and the ring-crossing repair half of it
+                            from when that pass starts; the output is still a correct
+                            trace, with more fills, a less polished outline, or rings
+                            left crossing as --no-repair ships them. The palette and the
                             writer do not read it. A nonzero budget makes the output
                             depend on the machine; 0 means no budget and a reproducible
                             output. Either way the merge is also bounded by a work cap

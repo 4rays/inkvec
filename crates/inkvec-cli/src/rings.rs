@@ -273,11 +273,21 @@ pub(crate) fn ring_infos(pts: &[Vec<Vec<Point>>]) -> Vec<Vec<RingInfo>> {
 ///
 /// `polys` are the measured boundaries the fits came from (indexed like `fitted`), `cfg`
 /// the fit configuration the refits use. `INKVEC_TIMING` prints the time of each phase.
+///
+/// vectini: `deadline` (from `--time-budget`) is the moment after which no further refit is
+/// started: a round that finds crossings after it ends the repair, a refit wave skips the
+/// edges it has not started, and the restore pass offers no pins-only fit. The rings that
+/// are still crossing are shipped as they are, which is what `--no-repair` ships for all of
+/// them. Measured on a 2048-px upscaled mark with 16 guilty boundaries of 1k-6k points:
+/// ten rounds took 17 s of a 21 s trace, the same six boundaries refitted every round.
+/// Without a deadline nothing reads the clock, so a trace without a budget stays
+/// reproducible.
 pub(crate) fn repair_ring_crossings(
     order: &[FaceRings],
     fitted: &mut [FittedPath],
     polys: &[inkvec_core::Polyline],
     cfg: &FitConfig,
+    deadline: Option<inkvec_core::clock::Instant>,
 ) -> usize {
     const ROUNDS: usize = 10;
     let mut st = RepairState::new(fitted, polys);
@@ -298,6 +308,21 @@ pub(crate) fn repair_ring_crossings(
         if guilty.is_empty() {
             break;
         }
+        // vectini: out of time -- ship the rings as they are.
+        if past(deadline) {
+            inkvec_core::progress::note(|| {
+                format!(
+                    "round {}: {} crossing boundar{} left unrepaired, time budget spent",
+                    round + 1,
+                    guilty.len(),
+                    if guilty.len() == 1 { "y" } else { "ies" }
+                )
+            });
+            diag::debug(timing, || {
+                format!("  [t] repair stopped by the time budget before round {}", round + 1)
+            });
+            break;
+        }
         let mut proposed = st.propose_pins(&guilty, &hits, fitted, polys);
         inkvec_core::progress::note(|| {
             format!(
@@ -316,7 +341,7 @@ pub(crate) fn repair_ring_crossings(
                 round_t.elapsed().as_secs_f64() * 1e3
             )
         });
-        for (k, f, by_pin) in st.refit(&guilty, &proposed, polys, cfg) {
+        for (k, f, by_pin) in st.refit(&guilty, &proposed, polys, cfg, deadline) {
             if by_pin {
                 st.pins[k] = proposed.remove(&k).unwrap_or_default();
                 st.pinned_rounds[k] += 1;
@@ -340,9 +365,14 @@ pub(crate) fn repair_ring_crossings(
         changed = Some(guilty.iter().copied().collect());
     }
     if !st.refit_vertices.is_empty() {
-        st.restore(&rings, fitted, polys, cfg, timing);
+        st.restore(&rings, fitted, polys, cfg, timing, deadline);
     }
     st.repaired
+}
+
+/// vectini: whether `deadline` has passed. Never reads the clock without one.
+fn past(deadline: Option<inkvec_core::clock::Instant>) -> bool {
+    deadline.is_some_and(|d| inkvec_core::clock::Instant::now() >= d)
 }
 
 /// Each crossing in the rings (only those touching an edge in `changed`, when given) as
@@ -458,12 +488,18 @@ impl RepairState {
         proposed: &std::collections::HashMap<usize, Vec<usize>>,
         polys: &[inkvec_core::Polyline],
         cfg: &FitConfig,
+        deadline: Option<inkvec_core::clock::Instant>,
     ) -> Vec<(usize, multimodel::MultimodelFit, bool)> {
         use rayon::prelude::*;
         let live = inkvec_core::progress::handle();
         guilty
             .par_iter()
-            .map(|&k| {
+            .filter_map(|&k| {
+                // vectini: a refit not yet started when the budget runs out is skipped;
+                // the edge keeps its current fit.
+                if past(deadline) {
+                    return None;
+                }
                 live.check();
                 // The program under a cap of `c` with the pins `p`; with no pins, the capped
                 // program this repair always used.
@@ -477,7 +513,7 @@ impl RepairState {
                     })
                 };
                 let halved = fit((self.cap[k] / 2).max(1), &self.pins[k]);
-                match proposed.get(&k) {
+                Some(match proposed.get(&k) {
                     Some(p) => {
                         let pinned = fit(self.cap[k], p);
                         if halved.cost < pinned.cost {
@@ -487,7 +523,7 @@ impl RepairState {
                         }
                     }
                     None => (k, halved, false),
-                }
+                })
             })
             .collect()
     }
@@ -579,6 +615,7 @@ impl RepairState {
         polys: &[inkvec_core::Polyline],
         cfg: &FitConfig,
         timing: bool,
+        deadline: Option<inkvec_core::clock::Instant>,
     ) {
         use rayon::prelude::*;
         let live = inkvec_core::progress::handle();
@@ -605,6 +642,11 @@ impl RepairState {
         let pins_only: std::collections::HashMap<usize, FittedPath> = keys
             .par_iter()
             .filter_map(|&k| {
+                // vectini: no new fits once the budget is spent; the original and the
+                // smoothed refit are still offered below, neither needs a fit.
+                if past(deadline) {
+                    return None;
+                }
                 let p = last_proposed.get(&k).unwrap_or(&pins[k]);
                 (!p.is_empty() && cap[k] < polys[k].len().max(2)).then(|| {
                     live.check();
